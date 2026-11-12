@@ -79,6 +79,78 @@
   ignore_errors: true
   changed_when: false
 
+#
+# Compare key digests, rather than just checking that names are defined: a rebuilt client cluster
+# keeps its name but gets a new key, which the storage cluster would not otherwise notice.
+#
+- name: Remote Cluster Config - API-CLI | Client Cluster (access) | Get digest of own key
+  shell: |
+    /usr/lpp/mmfs/bin/mmauth show . | awk '/SHA digest/ {print $3}'
+  register: client_key_digest_result
+  changed_when: false
+  failed_when: false
+  run_once: True
+
+- name: Remote Cluster Config - API-CLI | Client Cluster (access) | Get digest of Storage Cluster key held on client
+  shell: |
+    /usr/lpp/mmfs/bin/mmremotecluster show {{ owning_cluster_name }} | awk '/SHA digest/ {print $3}'
+  register: owning_key_held_digest_result
+  changed_when: false
+  failed_when: false
+  run_once: True
+  when: remote_cluster_check_owning_cluster.rc == 0
+
+- name: Remote Cluster Config - API-CLI | Storage Cluster (owner) | Get current key of Storage Cluster
+  uri:
+    validate_certs: "{{ scale_remotemount_validate_certs_uri }}"
+    force_basic_auth: yes
+    url: https://{{ scale_remotemount_storage_gui_hostname }}:{{ scale_remotemount_storage_cluster_gui_port }}/{{ scale_remotemount_endpoint }}/authenticationkey/
+    method: GET
+    user: "{{ scale_remotemount_storage_gui_username }}"
+    password: "{{ scale_remotemount_storage_gui_password }}"
+    body_format: raw
+    status_code:
+      - 200
+  register: owning_key_current_result
+  run_once: True
+
+- set_fact:
+    # digest of our key as the storage cluster has it ('' if not defined there, or not reported)
+    _scale_rm_storage_held_client_digest: "{{ ((remote_clusters_results.json | default({})).remoteClusters | default([{}]) | first).keyDigest | default('') }}"
+    _scale_rm_client_digest: "{{ client_key_digest_result.stdout | trim }}"
+    # digest of the storage key as the client has it, and as it actually is
+    _scale_rm_client_held_owning_digest: "{{ (owning_key_held_digest_result.stdout | default('')) | trim }}"
+    _scale_rm_owning_digest: "{{ owning_key_current_result.json.key | select('match', '^keyDigest=') | list | first | default('') | regex_replace('^keyDigest=', '') }}"
+  run_once: True
+
+- set_fact:
+    # storage cluster has a different key for us than we now have, e.g. client cluster was rebuilt
+    _scale_rm_client_key_stale: >-
+      {{ remote_clusters_results.status | default(0) == 200
+         and _scale_rm_storage_held_client_digest != '' and _scale_rm_client_digest != ''
+         and _scale_rm_storage_held_client_digest != _scale_rm_client_digest }}
+    # we hold a different key for the storage cluster than it now has
+    _scale_rm_owning_key_stale: >-
+      {{ remote_cluster_check_owning_cluster.rc == 0
+         and _scale_rm_client_held_owning_digest != '' and _scale_rm_owning_digest != ''
+         and _scale_rm_client_held_owning_digest != _scale_rm_owning_digest }}
+  run_once: True
+
+- set_fact:
+    _scale_rm_send_client_key: "{{ remote_clusters_results.status | default(0) == 400 or scale_remotemount_forceRun | bool or _scale_rm_client_key_stale | bool }}"
+  run_once: True
+
+- name: Remote Cluster Config - API-CLI | Key digests
+  debug:
+    msg:
+      - "Client key (mmauth show .):                 {{ _scale_rm_client_digest }}"
+      - "Client key as held by storage cluster:      {{ _scale_rm_storage_held_client_digest | default('(not defined)', true) }}"
+      - "Storage key as held by client:              {{ _scale_rm_client_held_owning_digest | default('(not defined)', true) }}"
+      - "Storage key (current):                      {{ _scale_rm_owning_digest }}"
+      - "{{ 'Client key is STALE on the storage cluster: will be re-registered' if _scale_rm_client_key_stale | bool else 'Client key matches' }}"
+      - "{{ 'Storage key is STALE on the client: will be updated' if _scale_rm_owning_key_stale | bool else 'Storage key matches' }}"
+  run_once: True
+
 - name: Remote Cluster Config - API-CLI | Storage Cluster (owner) | Delete the Client Cluster, if it exists
   block:
     - name: "DELETE: {{ scale_remotemount_endpoint }}/remoteclusters/{{ access_cluster_name }}"
@@ -108,7 +180,7 @@
       delay: "{{ scale_remotemount_restapi_retries_delay }}"
       run_once: True
   when:
-    - not remote_clusters_results.failed and scale_remotemount_forceRun | bool
+    - not remote_clusters_results.failed and (scale_remotemount_forceRun | bool or _scale_rm_client_key_stale | bool)
 
 - name: "Remote Cluster Config - API-CLI | If remote cluster (access) connection is already configured, nothing to do."
   debug:
@@ -116,6 +188,7 @@
   run_once: True
   when:
     - (remote_clusters_results.status == 200) or (scale_remotemount_forceRun | bool)
+    - not (_scale_rm_client_key_stale | bool or _scale_rm_owning_key_stale | bool)
 
 # Get node names and check if gpfs deamon is running.
 
@@ -163,21 +236,21 @@
         msg: "Configure remote Cluster connection between Storage Cluster (owner) and Client Cluster (access)"
       run_once: True
       when:
-        - (remote_clusters_results.status == 400) or (scale_remotemount_forceRun | bool)
+        - _scale_rm_send_client_key | bool
 
     - name: Remote Cluster Config - API-CLI | Remote Cluster connection status
       debug:
         msg: "Remote Cluster connection to ('{{ access_cluster_name }}') is not configured, procceding with configuration"
       run_once: True
       when:
-        - (remote_clusters_results.status == 400) or (scale_remotemount_forceRun | bool)
+        - _scale_rm_send_client_key | bool
 
     - name: Remote Cluster Config - API-CLI | Client Cluster (Access) | Get the Public key from CLI and register
       shell: "cat /var/mmfs/ssl/id_rsa_committed.pub"
       register: accesskey_result
       run_once: True
       when:
-        - (remote_clusters_results.status == 400) or (scale_remotemount_forceRun | bool)
+        - _scale_rm_send_client_key | bool
 
     - name: Remote Cluster Config - API-CLI |  Client Cluster (accesing) | scale_remotemount_debug | Print out the Client Cluster (access) Public Key results
       debug:
@@ -215,7 +288,7 @@
       register: send_key
       run_once: True
       when:
-        - (remote_clusters_results.status == 400) or (scale_remotemount_forceRun | bool)
+        - _scale_rm_send_client_key | bool
 
     - name: "Remote Cluster Config - API-CLI | Storage Cluster (owner) | Check the result of adding the Client Cluster {{ send_key.json.jobs[0].jobId }}"
       uri:
@@ -231,7 +304,7 @@
       delay: "{{ scale_remotemount_restapi_retries_delay }}"
       run_once: True
       when:
-        - (remote_clusters_results.status == 400) or (scale_remotemount_forceRun | bool)
+        - _scale_rm_send_client_key | bool
 
     - name: Remote Cluster Config - API-CLI | Storage Cluster (owner) | Get the Public Key
       uri:
@@ -387,4 +460,4 @@
        - "{{ scale_remotemount_storage_pub_key_location_json }}"
 
   when:
-    - (remote_clusters_results.status == 400) or (remote_cluster_check_owning_cluster.rc != 0) or (scale_remotemount_forceRun | bool)
+    - (_scale_rm_send_client_key | bool) or (remote_cluster_check_owning_cluster.rc != 0) or (_scale_rm_owning_key_stale | bool)

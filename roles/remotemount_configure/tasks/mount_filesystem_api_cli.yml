@@ -264,8 +264,10 @@
     msg: >-
       Cannot reach remote filesystem {{ item.item.scale_remotemount_client_filesystem_name }}
       on {{ owning_cluster_name }}: {{ item.stderr }}.
-      Check /var/adm/ras/mmfs.log.latest; error 233 when probing remote quorum nodes
-      usually means the storage cluster has a stale public key for this cluster.
+      Check /var/adm/ras/mmfs.log.latest: error 233 when probing remote quorum nodes, with
+      "The key used by the contact node ... has changed", means the two clusters hold different
+      keys for each other (the message is misleading about which side is stale).
+      Compare the digests printed by the key exchange tasks.
   loop: "{{ remote_filesystem_reachable.results }}"
   loop_control:
     label: "{{ item.item.scale_remotemount_client_filesystem_name }}"
