@@ -67,6 +67,7 @@
     status_code:
       - 200
   register: remote_clusters_results
+  run_once: True
   ignore_errors: true
 
 
@@ -141,8 +142,11 @@
     msg: "On Client Cluster, Check if the Filesystem's is already configured."
   run_once: True
 
+# Check the LOCAL remotefs definition rather than mmlsfs, which also fails
+# (non-zero rc) when the remote cluster is unreachable, and so was being
+# misread as "filesystem not configured".
 - name: Mount Filesystem - Rest-API | Mount Filesystem | Client Cluster access | Check if the Filesystem's is already configured with CLI.
-  shell: "/usr/lpp/mmfs/bin/mmlsfs {{ item.scale_remotemount_client_filesystem_name }} -Y"
+  shell: "/usr/lpp/mmfs/bin/mmremotefs show all | awk -v fs={{ item.scale_remotemount_client_filesystem_name }} '$1 == fs {found=1} END {exit !found}'"
   register: remote_filesystem_results_cli
   changed_when: false
   failed_when: false
@@ -175,65 +179,102 @@
   register: client_cluster_add_remotefs
   loop: "{{ remote_filesystem_results_cli.results }}"
   when:
-    - item.rc != 0 or scale_remotemount_forceRun | bool
+    # forceRun only resets the storage side, so don't re-add an existing local definition
+    - item.rc != 0
   failed_when:
     - "client_cluster_add_remotefs.rc != 0"
 
-# Get node names
+# Everything below runs once, from one client node. State is read from GPFS itself:
+#   mmlscluster -Y: node names; mmgetstate -a -Y: daemon states; mmlsmount -Y: mounts.
+# NB mmlsmount lists nodes from ALL clusters mounting the filesystem, so mounts are filtered
+# on this cluster's name and compared by node name, not counted.
+- name: Client Cluster (access) | Get names of all cluster nodes
+  shell: |
+    /usr/lpp/mmfs/bin/mmlscluster -Y | awk -F: '$2=="clusterNode" && $3=="0" {print $8}'
+  register: _scale_rm_cluster_nodes
+  changed_when: false
+  failed_when: _scale_rm_cluster_nodes.rc != 0 or _scale_rm_cluster_nodes.stdout_lines | length == 0
+  run_once: true
 
-- name: Mount Filesystem - Rest-API | Client Cluster (access) | GET the cluster nodes name information
-  shell: /usr/lpp/mmfs/bin/mmlscluster -Y | grep -v HEADER | grep clusterNode |  cut -d ':' -f 8
-  register: access_node_names
+- name: Client Cluster (access) | Work out which nodes should mount the filesystems
+  set_fact:
+    # scale_remotemount_client_mount_on_nodes may be 'all' or comma-separated names (full or short)
+    _scale_rm_expected_nodes: >-
+      {{ _scale_rm_cluster_nodes.stdout_lines
+         if (scale_remotemount_client_mount_on_nodes | default('all')) == 'all'
+         else _scale_rm_cluster_nodes.stdout_lines
+              | select('match', '^(' ~ (scale_remotemount_client_mount_on_nodes.split(',') | map('trim') | map('regex_escape') | join('|')) ~ ')([.].*)?$')
+              | list }}
+  run_once: true
+
+- name: Client Cluster (access) | Get cluster nodes whose GPFS daemon is not active
+  shell: |
+    /usr/lpp/mmfs/bin/mmgetstate -a -Y | awk -F: '$3=="0" && $9!="active" {print $16}'
+  register: _scale_rm_inactive_nodes
+  changed_when: false
+  run_once: true
+
+- name: Client Cluster (access) | Start GPFS daemon on expected nodes where it is down
+  command: /usr/lpp/mmfs/bin/mmstartup -N {{ _scale_rm_down | join(',') }}
+  vars:
+    _scale_rm_down: "{{ _scale_rm_expected_nodes | intersect(_scale_rm_inactive_nodes.stdout_lines) }}"
+  when: _scale_rm_down | length > 0
+  run_once: true
+
+# Starting the daemon also automounts filesystems defined with -A yes, so a node that was
+# just down is normally mounted again by the time it is active.
+- name: Client Cluster (access) | Wait for GPFS daemon to be active on expected nodes
+  shell: >-
+    /usr/lpp/mmfs/bin/mmgetstate -N {{ _scale_rm_expected_nodes | join(',') }} -Y |
+    awk -F: '$3=="0" && $9!="active" {n++} END {exit n>0}'
+  register: _scale_rm_daemons_active
+  until: _scale_rm_daemons_active.rc == 0
+  retries: 30
+  delay: 10
   changed_when: false
   failed_when: false
-  run_once: True
-
-- name: scale_remotemount_debug | Client Cluster (access) | Print the Cluster Information
-  debug:
-    msg: "{{ access_node_names.stdout_lines |  join(',') }}"
-  when: scale_remotemount_debug is defined and scale_remotemount_debug | bool
-  run_once: True
-
-- set_fact:
-    accessing_nodes_name: []
-  run_once: True
-
-- set_fact:
-    accessing_nodes_name: "{{ access_node_names.stdout_lines |  join(',')  }}"
-  run_once: True
-
-- name: Client Cluster (access) | Check if GPFS deamon is started
-  shell: /usr/lpp/mmfs/bin/mmgetstate -Y -N {{ accessing_nodes_name }} | grep -v HEADER | cut -d ':' -f 9
-  register: gpfs_deamon_state
-  changed_when: false
   run_once: true
 
-- name: Client Cluster (access) | Fail if GPFS deamon is not started
+- name: Client Cluster (access) | Fail if GPFS daemon is not active on expected nodes
   fail:
-    msg: "Scale/GPFS deamon is NOT running on one or serveral of your client cluster node. Check and run mmount manually"
-  when: "'down' in gpfs_deamon_state.stdout"
+    msg: >-
+      GPFS daemon is not active on all of: {{ _scale_rm_expected_nodes | join(', ') }}.
+      Check 'mmgetstate -a' and /var/adm/ras/mmfs.log.latest on the affected nodes.
+  when: _scale_rm_daemons_active.rc != 0
   run_once: true
 
-# Not adding any check here, runs only when when mmremotefs add task is also run.
-
-- name: Client Cluster (access) | Mount remote filesystem on all client nodes - Output is from previous task, checks if the filesystem's is already mounted
+# Fail clearly if the remote cluster can't be reached, rather than carrying on.
+# Retries allow time for the cluster to join after a key exchange.
+- name: Client Cluster (access) | Check remote filesystems are reachable
   run_once: True
-  command: /usr/lpp/mmfs/bin/mmmount {{ item.item.scale_remotemount_client_filesystem_name }} -N {{ scale_remotemount_client_mount_on_nodes | default('all') }}
-  loop: "{{ remote_filesystem_results_cli.results }}"
-  when:
-    - item.rc != 0 or scale_remotemount_forceRun | bool
-  register: client_cluster_mount_remotefs
+  command: /usr/lpp/mmfs/bin/mmlsfs {{ item.scale_remotemount_client_filesystem_name }} -Y
+  loop: "{{ scale_remotemount_filesystem_name }}"
   loop_control:
-    label: "{{ item }}"
-  failed_when:
-    - "client_cluster_mount_remotefs.rc != 0"
-
-# Adding a stdout from previous as the stdout from the loop abow can be confusing when several loops.
-
-- name:  Client Cluster (access) | Mount remote filesystem on all client nodes - shows stdout from the previous task.
-  debug:
-    msg: "Message from mount remote filesystem task: {{ item }}"
-  loop: "{{ client_cluster_mount_remotefs | json_query('results[*].stdout') }}"
-  run_once: True
-  ignore_errors: true
+    label: "{{ item.scale_remotemount_client_filesystem_name }}"
+  register: remote_filesystem_reachable
+  until: remote_filesystem_reachable.rc == 0
+  retries: 6
+  delay: 10
   changed_when: false
+  failed_when: false
+
+- name: Client Cluster (access) | Fail if remote filesystems are not reachable
+  run_once: True
+  fail:
+    msg: >-
+      Cannot reach remote filesystem {{ item.item.scale_remotemount_client_filesystem_name }}
+      on {{ owning_cluster_name }}: {{ item.stderr }}.
+      Check /var/adm/ras/mmfs.log.latest; error 233 when probing remote quorum nodes
+      usually means the storage cluster has a stale public key for this cluster.
+  loop: "{{ remote_filesystem_reachable.results }}"
+  loop_control:
+    label: "{{ item.item.scale_remotemount_client_filesystem_name }}"
+  when: item.rc != 0
+
+- name: Client Cluster (access) | Ensure remote filesystems are mounted on expected nodes
+  include_tasks: ensure_remote_fs_mounted.yml
+  loop: "{{ scale_remotemount_filesystem_name }}"
+  loop_control:
+    loop_var: _scale_rm_fs
+    label: "{{ _scale_rm_fs.scale_remotemount_client_filesystem_name }}"
+  run_once: true

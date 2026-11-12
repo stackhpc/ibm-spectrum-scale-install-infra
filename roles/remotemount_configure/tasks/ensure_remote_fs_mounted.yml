@@ -1,0 +1,40 @@
+---
+# Mount one remote filesystem (_scale_rm_fs) on any expected node (_scale_rm_expected_nodes)
+# that does not have it mounted. Idempotent: mmmount -N returns 0 for nodes already mounted,
+# but is only run when something is missing, so 'changed' is meaningful.
+# Unlike mmmount -a, -N does not fail because of unrelated nodes whose daemon is down.
+- name: "Ensure mounted | {{ _scale_rm_fs.scale_remotemount_client_filesystem_name }} | Get nodes of this cluster with it mounted"
+  shell: >-
+    /usr/lpp/mmfs/bin/mmlsmount {{ _scale_rm_fs.scale_remotemount_client_filesystem_name }} -Y |
+    awk -F: -v c='{{ access_cluster_name }}' '$3=="0" && $13==c {print $12}'
+  register: _scale_rm_mounted
+  changed_when: false
+  run_once: true
+
+- name: "Ensure mounted | {{ _scale_rm_fs.scale_remotemount_client_filesystem_name }} | Mount on nodes where it is missing"
+  command: /usr/lpp/mmfs/bin/mmmount {{ _scale_rm_fs.scale_remotemount_client_filesystem_name }} -N {{ _scale_rm_missing | join(',') }}
+  vars:
+    _scale_rm_missing: "{{ _scale_rm_expected_nodes | difference(_scale_rm_mounted.stdout_lines) }}"
+  when: _scale_rm_missing | length > 0
+  run_once: true
+
+# mount can take a few seconds to show up in mmlsmount
+- name: "Ensure mounted | {{ _scale_rm_fs.scale_remotemount_client_filesystem_name }} | Wait for mounts on all expected nodes"
+  shell: >-
+    /usr/lpp/mmfs/bin/mmlsmount {{ _scale_rm_fs.scale_remotemount_client_filesystem_name }} -Y |
+    awk -F: -v c='{{ access_cluster_name }}' '$3=="0" && $13==c {print $12}'
+  register: _scale_rm_mounted_after
+  until: _scale_rm_expected_nodes | difference(_scale_rm_mounted_after.stdout_lines) | length == 0
+  retries: 6
+  delay: 10
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: "Ensure mounted | {{ _scale_rm_fs.scale_remotemount_client_filesystem_name }} | Fail if still not mounted"
+  fail:
+    msg: >-
+      {{ _scale_rm_fs.scale_remotemount_client_filesystem_name }} is not mounted on:
+      {{ _scale_rm_expected_nodes | difference(_scale_rm_mounted_after.stdout_lines) | join(', ') }}
+  when: _scale_rm_expected_nodes | difference(_scale_rm_mounted_after.stdout_lines) | length > 0
+  run_once: true

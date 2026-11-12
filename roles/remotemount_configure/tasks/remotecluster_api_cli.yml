@@ -146,11 +146,11 @@
   changed_when: false
   run_once: true
 
-- name: Remote Cluster Config - API-CLI | Client Cluster (access) | Fail if GPFS deamon is not started
-  fail:
-    msg: "Scale/GPFS deamon is NOT running on one or serveral of your client cluster node. Check and run mmount manually"
+# Informational only: the mount step (mount_filesystem_api_cli.yml) starts any down daemons.
+- name: Remote Cluster Config - API-CLI | Client Cluster (access) | Warn if GPFS deamon is not started on some nodes
+  debug:
+    msg: "Scale/GPFS daemon is down on one or more client cluster nodes. It will be started before filesystems are mounted."
   when: "'down' in gpfs_deamon_state.stdout"
-  ignore_errors: true
   run_once: true
 
 #
